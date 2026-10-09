@@ -1,10 +1,10 @@
 #pragma once
 
-#include "multiqueue/modes/common.hpp"
+#include "multififo/modes/common.hpp"
 
 #include <optional>
 
-namespace multiqueue::mode {
+namespace multififo::mode {
 
 template <int num_pop_candidates = 2>
 class StickMark : public StickyModeBase<num_pop_candidates> {
@@ -18,14 +18,14 @@ class StickMark : public StickyModeBase<num_pop_candidates> {
     template <typename Context>
     void mark_selection(Context const& ctx) noexcept {
         for (auto i : this->pop_index_) {
-            ctx.pq_guards()[i].set_mark(this->id() + 1);
+            ctx.queue_guards()[i].set_mark(this->id() + 1);
         }
     }
 
     template <typename Context>
     void replace_and_mark(Context const& ctx, std::size_t pos) noexcept {
         this->replace(ctx, pos);
-        ctx.pq_guards()[this->pop_index_[pos]].set_mark(this->id() + 1);
+        ctx.queue_guards()[this->pop_index_[pos]].set_mark(this->id() + 1);
     }
 
    protected:
@@ -40,9 +40,9 @@ class StickMark : public StickyModeBase<num_pop_candidates> {
             mark_selection(ctx);
         }
         while (true) {
-            auto keys = top_keys(ctx, this->pop_index_);
-            auto best_pos = best_position(ctx, keys);
-            auto& guard = ctx.pq_guards()[this->pop_index_[best_pos]];
+            auto ticks = top_ticks(ctx, this->pop_index_);
+            auto best_pos = best_position(ticks);
+            auto& guard = ctx.queue_guards()[this->pop_index_[best_pos]];
             if (!guard.try_lock_if_marked(this->id() + 1)) {
                 replace_and_mark(ctx, best_pos);
                 continue;
@@ -59,23 +59,27 @@ class StickMark : public StickyModeBase<num_pop_candidates> {
     }
 
     template <typename Context>
-    void push(Context& ctx, typename Context::value_type const& v) {
+    bool push(Context& ctx, typename Context::value_type const& v) {
         if (this->expired()) {
             this->reselect(ctx);
             mark_selection(ctx);
         }
         auto push_index = this->random_candidate();
         while (true) {
-            auto& guard = ctx.pq_guards()[this->pop_index_[push_index]];
+            auto& guard = ctx.queue_guards()[this->pop_index_[push_index]];
             if (guard.try_lock_if_marked(this->id() + 1)) {
-                guard.push_locked(v);
+                bool success = guard.push_locked(v);
                 guard.unlock_marked();
+                if (!success) {
+                    this->expire();
+                    return false;
+                }
                 this->consume();
-                return;
+                return true;
             }
             replace_and_mark(ctx, push_index);
         }
     }
 };
 
-}  // namespace multiqueue::mode
+}  // namespace multififo::mode

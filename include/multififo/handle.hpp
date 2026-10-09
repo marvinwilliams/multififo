@@ -1,8 +1,10 @@
 #pragma once
 
+#include "multififo/queue_guard.hpp"
+
 #include <optional>
 
-namespace multiqueue {
+namespace multififo {
 
 template <typename Context>
 class Handle : public Context::policy_type::mode_type {
@@ -22,26 +24,36 @@ class Handle : public Context::policy_type::mode_type {
     Handle &operator=(Handle &&) noexcept = default;
     ~Handle() = default;
 
-    void push(value_type const &v) {
-        mode_type::push(*context_, v);
+    // Pushes to the first queue that is neither locked nor full
+    bool scan_push(value_type const &v) {
+        for (auto *it = context_->queue_guards(); it != context_->queue_guards() + context_->num_queues(); ++it) {
+            if (it->try_push(v) == PushResult::success) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    std::optional<value_type> scan() {
-        for (auto *it = context_->pq_guards(); it != context_->pq_guards() + context_->num_pqs(); ++it) {
+    std::optional<value_type> scan_pop() {
+        for (auto *it = context_->queue_guards(); it != context_->queue_guards() + context_->num_queues(); ++it) {
             if (!it->try_lock()) {
                 continue;
             }
-            if (it->get_pq().empty()) {
-                it->unlock();
-                continue;
-            }
-            auto v = it->get_pq().top();
-            it->get_pq().pop();
-            it->popped();
+            auto v = it->pop_locked();
             it->unlock();
-            return v;
+            if (v) {
+                return v;
+            }
         }
         return std::nullopt;
+    }
+
+    // Fails only if the queues are (close to) full
+    bool try_push(value_type const &v) {
+        if (mode_type::push(*context_, v)) {
+            return true;
+        }
+        return scan_push(v);
     }
 
     std::optional<value_type> try_pop() {
@@ -54,8 +66,8 @@ class Handle : public Context::policy_type::mode_type {
         if (!Context::policy_type::scan) {
             return std::nullopt;
         }
-        return scan();
+        return scan_pop();
     }
 };
 
-}  // namespace multiqueue
+}  // namespace multififo

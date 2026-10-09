@@ -1,5 +1,7 @@
 #pragma once
 
+#include "multififo/queue_guard.hpp"
+
 #include "pcg_random.hpp"
 
 #include <algorithm>
@@ -8,10 +10,13 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <random>
 
-namespace multiqueue::mode {
+namespace multififo::mode {
+
+// A mode selects the queues a handle pushes to and pops from. It is a base class of the handle and provides
+//   bool push(Context&, value_type const&): false if the selected queue is full (the handle then scans all queues)
+//   std::optional<value_type> try_pop(Context&)
 
 struct BaseConfig {
     int seed{1};
@@ -21,16 +26,11 @@ struct StickyConfig : BaseConfig {
     int stickiness{16};
 };
 
-struct SplitStickyConfig : BaseConfig {
-    int pop_stickiness{16};
-    int push_stickiness{64};
-};
-
 template <int NumPopCandidates>
 struct BaseSharedData {
     std::atomic_uint id_count{0};
 
-    explicit BaseSharedData(std::size_t /*num_pqs*/) noexcept {
+    explicit BaseSharedData(std::size_t /*num_queues*/) noexcept {
     }
 
     [[nodiscard]] unsigned next_id() noexcept {
@@ -39,50 +39,25 @@ struct BaseSharedData {
 };
 
 template <typename Context, std::size_t N>
-[[nodiscard]] std::array<typename Context::key_type, N> top_keys(Context const& ctx,
-                                                                 std::array<std::size_t, N> const& indices) noexcept {
-    std::array<typename Context::key_type, N> keys{};
+[[nodiscard]] std::array<typename Context::tick_type, N> top_ticks(Context const& ctx,
+                                                                   std::array<std::size_t, N> const& indices) noexcept {
+    std::array<typename Context::tick_type, N> ticks{};
     for (std::size_t i = 0; i < N; ++i) {
-        keys[i] = ctx.pq_guards()[indices[i]].top_key();
+        ticks[i] = ctx.queue_guards()[indices[i]].top_tick();
     }
-    return keys;
+    return ticks;
 }
 
-template <typename Context, std::size_t N>
-[[nodiscard]] std::size_t best_position(Context const& ctx,
-                                        std::array<typename Context::key_type, N> const& keys) noexcept {
+// The position of the queue with the oldest element (empty queues have the largest tick)
+template <typename Tick, std::size_t N>
+[[nodiscard]] std::size_t best_position(std::array<Tick, N> const& ticks) noexcept {
     std::size_t best = 0;
     for (std::size_t i = 1; i < N; ++i) {
-        if (ctx.compare(keys[best], keys[i])) {
+        if (ticks[i] < ticks[best]) {
             best = i;
         }
     }
     return best;
-}
-
-template <typename Context, std::size_t N>
-[[nodiscard]] std::size_t worst_position(Context const& ctx,
-                                         std::array<typename Context::key_type, N> const& keys) noexcept {
-    std::size_t worst = 0;
-    for (std::size_t i = 1; i < N; ++i) {
-        if (ctx.compare(keys[i], keys[worst])) {
-            worst = i;
-        }
-    }
-    return worst;
-}
-
-template <typename Context>
-[[nodiscard]] std::optional<typename Context::value_type> take_better_than(Context const& ctx,
-                                                                           typename Context::guard_type& guard,
-                                                                           typename Context::key_type const& key) {
-    if (guard.get_pq().empty() || !ctx.compare(key, Context::get_key(guard.get_pq().top()))) {
-        return std::nullopt;
-    }
-    auto v = guard.get_pq().top();
-    guard.get_pq().pop();
-    guard.popped();
-    return v;
 }
 
 template <int NumPopCandidates>
@@ -113,30 +88,35 @@ class ModeBase {
         return rng_;
     }
 
-    [[nodiscard]] std::size_t random_index(std::size_t num_pqs) noexcept {
-        return std::uniform_int_distribution<std::size_t>{0, num_pqs - 1}(rng_);
+    [[nodiscard]] std::size_t random_index(std::size_t num_queues) noexcept {
+        return std::uniform_int_distribution<std::size_t>{0, num_queues - 1}(rng_);
     }
 
     [[nodiscard]] std::size_t random_candidate() noexcept {
         return rng_() % static_cast<std::size_t>(NumPopCandidates);
     }
 
-    [[nodiscard]] index_array sample_indices(std::size_t num_pqs) noexcept {
+    [[nodiscard]] index_array sample_indices(std::size_t num_queues) noexcept {
         index_array indices{};
         for (auto it = indices.begin(); it != indices.end(); ++it) {
             do {
-                *it = random_index(num_pqs);
+                *it = random_index(num_queues);
             } while (std::find(indices.begin(), it, *it) != it);
         }
         return indices;
     }
 
     template <typename Context>
-    void push_random(Context& ctx, typename Context::value_type const& v) {
+    [[nodiscard]] bool push_random(Context& ctx, typename Context::value_type const& v) {
         while (true) {
-            auto& guard = ctx.pq_guards()[random_index(ctx.num_pqs())];
-            if (guard.try_push(v)) {
-                return;
+            auto& guard = ctx.queue_guards()[random_index(ctx.num_queues())];
+            switch (guard.try_push(v)) {
+                case PushResult::success:
+                    return true;
+                case PushResult::full:
+                    return false;
+                case PushResult::locked:
+                    break;
             }
         }
     }
@@ -169,10 +149,6 @@ class StickyModeBase : public ModeBase<NumPopCandidates> {
         return remaining_ <= 0;
     }
 
-    [[nodiscard]] bool is_fresh() const noexcept {
-        return remaining_ == stickiness_;
-    }
-
     void renew() noexcept {
         remaining_ = stickiness_;
     }
@@ -187,7 +163,7 @@ class StickyModeBase : public ModeBase<NumPopCandidates> {
 
     template <typename Context>
     void reselect(Context const& ctx) noexcept {
-        pop_index_ = this->sample_indices(ctx.num_pqs());
+        pop_index_ = this->sample_indices(ctx.num_queues());
         renew();
     }
 
@@ -201,23 +177,14 @@ class StickyModeBase : public ModeBase<NumPopCandidates> {
     template <typename Context>
     void replace(Context const& ctx, std::size_t position) noexcept {
         assert(position < pop_index_.size());
-        assert(ctx.num_pqs() >= pop_index_.size());
+        assert(ctx.num_queues() >= pop_index_.size());
         pop_index_[position] = static_cast<std::size_t>(-1);
         std::size_t index{};
         do {
-            index = this->random_index(ctx.num_pqs());
+            index = this->random_index(ctx.num_queues());
         } while (std::find(pop_index_.begin(), pop_index_.end(), index) != pop_index_.end());
         pop_index_[position] = index;
     }
-
-    template <typename Context>
-    void replace_from(Context const& ctx, std::size_t position) noexcept {
-        for (auto it = pop_index_.begin() + position; it != pop_index_.end(); ++it) {
-            do {
-                *it = this->random_index(ctx.num_pqs());
-            } while (std::find(pop_index_.begin(), it, *it) != it);
-        }
-    }
 };
 
-}  // namespace multiqueue::mode
+}  // namespace multififo::mode

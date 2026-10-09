@@ -1,7 +1,7 @@
 #pragma once
 
-#include "multiqueue/build_config.hpp"
-#include "multiqueue/modes/common.hpp"
+#include "multififo/build_config.hpp"
+#include "multififo/modes/common.hpp"
 
 #include <atomic>
 #include <cassert>
@@ -10,7 +10,7 @@
 #include <optional>
 #include <vector>
 
-namespace multiqueue::mode {
+namespace multififo::mode {
 
 template <int num_pop_candidates = 2>
 class StickSwap : public StickyModeBase<num_pop_candidates> {
@@ -25,8 +25,9 @@ class StickSwap : public StickyModeBase<num_pop_candidates> {
     struct SharedData : base_type::shared_data_type {
         permutation_type permutation;
 
-        explicit SharedData(std::size_t num_pqs) : base_type::shared_data_type{num_pqs}, permutation(num_pqs) {
-            for (std::size_t i = 0; i < num_pqs; ++i) {
+        explicit SharedData(std::size_t num_queues)
+            : base_type::shared_data_type{num_queues}, permutation(num_queues) {
+            for (std::size_t i = 0; i < num_queues; ++i) {
                 permutation[i].value = i;
             }
         }
@@ -61,15 +62,15 @@ class StickSwap : public StickyModeBase<num_pop_candidates> {
         this->renew();
     }
 
-    [[nodiscard]] std::size_t pq_index(permutation_type const& perm, std::size_t index) const noexcept {
+    [[nodiscard]] std::size_t queue_index(permutation_type const& perm, std::size_t index) const noexcept {
         return perm[offset_ + index].value.load(std::memory_order_relaxed);
     }
 
     template <typename Context>
-    [[nodiscard]] typename base_type::index_array pq_indices(Context const& ctx) const noexcept {
+    [[nodiscard]] typename base_type::index_array queue_indices(Context const& ctx) const noexcept {
         typename base_type::index_array indices{};
         for (std::size_t i = 0; i < indices.size(); ++i) {
-            indices[i] = pq_index(ctx.shared_data().permutation, i);
+            indices[i] = queue_index(ctx.shared_data().permutation, i);
         }
         return indices;
     }
@@ -85,10 +86,10 @@ class StickSwap : public StickyModeBase<num_pop_candidates> {
             reassign_all(ctx);
         }
         while (true) {
-            auto indices = pq_indices(ctx);
-            auto keys = top_keys(ctx, indices);
-            auto best_pos = best_position(ctx, keys);
-            auto& guard = ctx.pq_guards()[indices[best_pos]];
+            auto indices = queue_indices(ctx);
+            auto ticks = top_ticks(ctx, indices);
+            auto best_pos = best_position(ticks);
+            auto& guard = ctx.queue_guards()[indices[best_pos]];
             if (!guard.try_lock()) {
                 swap_assignment(ctx.shared_data().permutation, best_pos);
                 continue;
@@ -105,20 +106,26 @@ class StickSwap : public StickyModeBase<num_pop_candidates> {
     }
 
     template <typename Context>
-    void push(Context& ctx, typename Context::value_type const& v) {
+    bool push(Context& ctx, typename Context::value_type const& v) {
         if (this->expired()) {
             reassign_all(ctx);
         }
         auto push_index = this->random_candidate();
         while (true) {
-            auto& guard = ctx.pq_guards()[pq_index(ctx.shared_data().permutation, push_index)];
-            if (guard.try_push(v)) {
-                this->consume();
-                return;
+            auto& guard = ctx.queue_guards()[queue_index(ctx.shared_data().permutation, push_index)];
+            switch (guard.try_push(v)) {
+                case PushResult::success:
+                    this->consume();
+                    return true;
+                case PushResult::full:
+                    this->expire();
+                    return false;
+                case PushResult::locked:
+                    swap_assignment(ctx.shared_data().permutation, push_index);
+                    break;
             }
-            swap_assignment(ctx.shared_data().permutation, push_index);
         }
     }
 };
 
-}  // namespace multiqueue::mode
+}  // namespace multififo::mode

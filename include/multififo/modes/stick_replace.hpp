@@ -1,10 +1,10 @@
 #pragma once
 
-#include "multiqueue/modes/common.hpp"
+#include "multififo/modes/common.hpp"
 
 #include <optional>
 
-namespace multiqueue::mode {
+namespace multififo::mode {
 
 template <int num_pop_candidates = 2>
 class StickReplace : public StickyModeBase<num_pop_candidates> {
@@ -23,9 +23,9 @@ class StickReplace : public StickyModeBase<num_pop_candidates> {
     std::optional<typename Context::value_type> try_pop(Context& ctx) {
         this->reselect_if_expired(ctx);
         while (true) {
-            auto keys = top_keys(ctx, this->pop_index_);
-            auto best_pos = best_position(ctx, keys);
-            auto& guard = ctx.pq_guards()[this->pop_index_[best_pos]];
+            auto ticks = top_ticks(ctx, this->pop_index_);
+            auto best_pos = best_position(ticks);
+            auto& guard = ctx.queue_guards()[this->pop_index_[best_pos]];
             if (!guard.try_lock()) {
                 this->replace(ctx, best_pos);
                 continue;
@@ -42,18 +42,24 @@ class StickReplace : public StickyModeBase<num_pop_candidates> {
     }
 
     template <typename Context>
-    void push(Context& ctx, typename Context::value_type const& v) {
+    bool push(Context& ctx, typename Context::value_type const& v) {
         this->reselect_if_expired(ctx);
         auto push_index = this->random_candidate();
         while (true) {
-            auto& guard = ctx.pq_guards()[this->pop_index_[push_index]];
-            if (guard.try_push(v)) {
-                this->consume();
-                return;
+            auto& guard = ctx.queue_guards()[this->pop_index_[push_index]];
+            switch (guard.try_push(v)) {
+                case PushResult::success:
+                    this->consume();
+                    return true;
+                case PushResult::full:
+                    this->expire();
+                    return false;
+                case PushResult::locked:
+                    this->replace(ctx, push_index);
+                    break;
             }
-            this->replace(ctx, push_index);
         }
     }
 };
 
-}  // namespace multiqueue::mode
+}  // namespace multififo::mode

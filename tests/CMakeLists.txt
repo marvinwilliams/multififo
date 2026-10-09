@@ -1,21 +1,17 @@
-add_executable(heap_test heap.cpp)
-target_link_libraries(heap_test PRIVATE multiqueue Threads::Threads Catch2::Catch2WithMain)
-
-add_executable(buffered_pq_test buffered_pq.cpp)
-target_link_libraries(buffered_pq_test PRIVATE multiqueue Threads::Threads Catch2::Catch2WithMain)
-
-add_executable(multiqueue_test multiqueue.cpp)
-target_link_libraries(multiqueue_test PRIVATE multiqueue Threads::Threads Catch2::Catch2WithMain)
+add_executable(multififo_test multififo.cpp)
+target_link_libraries(multififo_test PRIVATE multififo Threads::Threads Catch2::Catch2WithMain)
 
 add_executable(modes_test modes.cpp)
-target_link_libraries(modes_test PRIVATE multiqueue Threads::Threads Catch2::Catch2WithMain)
+target_link_libraries(modes_test PRIVATE multififo Threads::Threads Catch2::Catch2WithMain)
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/third_party/Catch2/extras")
+if(DEFINED Catch2_SOURCE_DIR)
+  list(APPEND CMAKE_MODULE_PATH "${Catch2_SOURCE_DIR}/extras")
+else()
+  list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/third_party/Catch2/extras")
+endif()
 include(Catch)
 
 if(BUILD_TESTING)
-  catch_discover_tests(heap_test)
-  catch_discover_tests(buffered_pq_test)
-  catch_discover_tests(multiqueue_test)
+  catch_discover_tests(multififo_test)
   catch_discover_tests(modes_test)
 endif()
